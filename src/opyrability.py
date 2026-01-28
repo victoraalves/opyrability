@@ -2445,3 +2445,756 @@ def are_overlapping(poly1, poly2):
        True if the polytopes overlap, False otherwise.
    """
     return not pc.is_empty(pc.intersect(poly1, poly2))
+
+
+# =============================================================================
+# Dynamic Operability Mapping Functions
+# =============================================================================
+# The functions below implement dynamic (time-varying) operability analysis,
+# enabling the evaluation of how operability sets evolve over time or with
+# respect to a varying parameter.
+
+def dynamic_operability(model: Callable[..., Union[float, np.ndarray]],
+                        AIS_bounds: np.ndarray,
+                        AIS_resolution: np.ndarray,
+                        time_bounds: np.ndarray,
+                        time_resolution: int,
+                        polytopic_trace: str = 'simplices',
+                        plot: bool = True,
+                        labels: str = None,
+                        time_label: str = None) -> dict:
+    """
+    Compute and visualize dynamic (time-varying) operability sets. This function
+    generates Achievable Output Sets (AOS) at multiple time instances and
+    constructs connected polytopes that show the temporal evolution of the
+    operability region.
+
+    This implements the dynamic operability analysis methodology as described
+    in the paper: "Dynamic Operability Analysis for Process Design and Control
+    of Modular Natural Gas Utilization Systems" (Dinh & Lima, I&ECR 2023).
+
+    This function is part of Python-based Process Operability package.
+
+    Control, Optimization and Design for Energy and Sustainability (CODES)
+    Group - West Virginia University - 2024
+
+    Author: Victor Alves
+
+    Parameters
+    ----------
+    model : Callable[..., Union[float, np.ndarray]]
+        Time-varying process model that calculates the relationship between
+        inputs (AIS) and outputs (AOS). The model should accept inputs and time
+        as arguments: model(u, t) -> y, where u is the input vector, t is time,
+        and y is the output vector.
+    AIS_bounds : np.ndarray
+        Bounds on the Available Input Set (AIS). Each row corresponds to the
+        lower and upper bound of each AIS variable.
+    AIS_resolution : np.ndarray
+        Array containing the resolution of the discretization grid for the AIS.
+        Each element corresponds to the resolution of each variable.
+    time_bounds : np.ndarray
+        Array of shape (2,) containing [t_initial, t_final] for the time range.
+    time_resolution : int
+        Number of time points to discretize the time range.
+    polytopic_trace : str, optional
+        Determines if the polytopes will be constructed using simplices or
+        polyhedra. Default is 'simplices'. Additional option is 'polyhedra'.
+    plot : bool, optional
+        Defines if the plot of dynamic operability sets is desired. Default is
+        True. For 2D output spaces, generates a 3D plot with time as the third
+        axis, showing connected polytopes evolving over time.
+    labels : str, optional
+        Labels for output axes. Accepts TeX math input as it uses matplotlib
+        math rendering. Default is None (uses y1, y2, ...).
+    time_label : str, optional
+        Label for the time axis. Default is None (uses 't' or 'Time').
+
+    Returns
+    -------
+    results : dict
+        Dictionary containing:
+        - 'AOS_regions': List of pc.Region objects, one for each time point
+        - 'AOS_vertices': List of vertex arrays for each time point
+        - 'time_points': Array of discretized time values
+        - 'AIS': Discretized Available Input Set
+        - 'polytopes_by_time': List of polytope lists for each time point
+
+    References
+    ----------
+    [1] S. Dinh and F. V. Lima. "Dynamic Operability Analysis for Process Design
+    and Control of Modular Natural Gas Utilization Systems." Ind. & Eng. Chem.
+    Res. 2023. https://doi.org/10.1021/acs.iecr.2c03543
+
+    [2] V. Gazzaneo, J. C. Carrasco, D. R. Vinson, and F. V. Lima. Process
+    Operability Algorithms: Past, Present, and Future Developments.
+    Ind. & Eng. Chem. Res. 59 (6), 2457-2470, 2020.
+    https://doi.org/10.1021/acs.iecr.9b05181
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> from opyrability import dynamic_operability
+    >>>
+    >>> # Define a time-varying model
+    >>> def model(u, t):
+    ...     y1 = u[0] + 0.5*u[1] + 0.1*t
+    ...     y2 = 0.3*u[0] + u[1] - 0.05*t
+    ...     return np.array([y1, y2])
+    >>>
+    >>> AIS_bounds = np.array([[0, 10], [0, 10]])
+    >>> AIS_resolution = [5, 5]
+    >>> time_bounds = np.array([0, 10])
+    >>> time_resolution = 5
+    >>>
+    >>> results = dynamic_operability(model, AIS_bounds, AIS_resolution,
+    ...                               time_bounds, time_resolution)
+    """
+
+    # Discretize the time range
+    time_points = np.linspace(time_bounds[0], time_bounds[1], time_resolution)
+
+    # Get dimensions
+    n_inputs = AIS_bounds.shape[0]
+
+    # Create the discretized AIS (constant across time)
+    AIS = create_grid(AIS_bounds, AIS_resolution)
+
+    # Preallocate results
+    AOS_regions = []
+    AOS_vertices_list = []
+    polytopes_by_time = []
+
+    # Compute AOS at each time point
+    print(f"Computing dynamic operability over {time_resolution} time points...")
+
+    for t_idx, t in enumerate(tqdm(time_points)):
+        # Create a model wrapper for this specific time point
+        def model_at_t(u, t_val=t):
+            return model(u, t_val)
+
+        # Use existing AIS2AOS_map function for forward mapping
+        AIS_grid, AOS_grid = AIS2AOS_map(model_at_t,
+                                          AIS_bounds,
+                                          AIS_resolution,
+                                          plot=False)
+
+        # Generate polytopes using existing functions
+        if polytopic_trace == 'simplices':
+            AIS_poly, AOS_poly = points2simplices(AIS_grid, AOS_grid)
+        elif polytopic_trace == 'polyhedra':
+            AIS_poly, AOS_poly = points2polyhedra(AIS_grid, AOS_grid)
+        else:
+            print('Invalid option for polytopic tracing. Using simplices.')
+            AIS_poly, AOS_poly = points2simplices(AIS_grid, AOS_grid)
+
+        # Create polytope region for this time point
+        Polytopes = []
+        Vertices_list = []
+        for i in range(len(AOS_poly)):
+            Vertices = AOS_poly[i]
+            Vertices_list.append(Vertices)
+            Polytopes.append(pc.qhull(Vertices))
+
+        AOS_region = pc.Region(Polytopes)
+        AOS_regions.append(AOS_region)
+        AOS_vertices_list.append(np.concatenate(Vertices_list, axis=0))
+        polytopes_by_time.append(Polytopes)
+
+    # Prepare results dictionary
+    results = {
+        'AOS_regions': AOS_regions,
+        'AOS_vertices': AOS_vertices_list,
+        'time_points': time_points,
+        'AIS': AIS,
+        'polytopes_by_time': polytopes_by_time
+    }
+
+    # Plot if requested and dimension is appropriate
+    if plot:
+        if AOS_regions[0].dim == 2:
+            plot_dynamic_operability(results,
+                                     labels=labels,
+                                     time_label=time_label)
+        elif AOS_regions[0].dim == 1:
+            plot_dynamic_operability_1D(results,
+                                        labels=labels,
+                                        time_label=time_label)
+        else:
+            print(f'Plotting not supported for {AOS_regions[0].dim}D output space.',
+                  'Results are still returned for analysis.')
+
+    return results
+
+
+def plot_dynamic_operability(results: dict,
+                             labels: str = None,
+                             time_label: str = None,
+                             alpha: float = 0.6,
+                             colormap: str = 'viridis',
+                             show_edges: bool = True,
+                             figsize: tuple = (10, 8)) -> None:
+    """
+    Plot dynamic operability results showing connected polytopes with time as
+    the third axis. This creates a 3D visualization where the AOS evolves along
+    the time axis, similar to Figures 8 and 9 in the dynamic operability paper.
+
+    This function is part of Python-based Process Operability package.
+
+    Control, Optimization and Design for Energy and Sustainability (CODES)
+    Group - West Virginia University - 2024
+
+    Author: Victor Alves
+
+    Parameters
+    ----------
+    results : dict
+        Results dictionary from dynamic_operability() containing:
+        - 'AOS_regions': List of pc.Region objects
+        - 'AOS_vertices': List of vertex arrays
+        - 'time_points': Array of time values
+    labels : str, optional
+        Labels for output axes. Default is None (uses y1, y2).
+    time_label : str, optional
+        Label for the time axis. Default is None (uses 't').
+    alpha : float, optional
+        Transparency of polytopes. Default is 0.6.
+    colormap : str, optional
+        Matplotlib colormap name for coloring polytopes by time. Default is
+        'viridis'.
+    show_edges : bool, optional
+        Whether to show edges of polytopes. Default is True.
+    figsize : tuple, optional
+        Figure size as (width, height). Default is (10, 8).
+
+    Returns
+    -------
+    None
+        Displays the plot.
+    """
+
+    AOS_vertices_list = results['AOS_vertices']
+    time_points = results['time_points']
+    AOS_regions = results['AOS_regions']
+
+    # Check dimension
+    if AOS_regions[0].dim != 2:
+        print(f"This plotting function is designed for 2D output spaces. "
+              f"Current dimension: {AOS_regions[0].dim}")
+        return
+
+    # Set up figure
+    fig = plt.figure(figsize=figsize)
+    ax = fig.add_subplot(111, projection='3d')
+
+    # Get colormap
+    cmap = plt.cm.get_cmap(colormap)
+    n_times = len(time_points)
+
+    # Normalize time for coloring
+    t_min, t_max = time_points[0], time_points[-1]
+
+    # Plot polytopes at each time point
+    for t_idx, (t, vertices) in enumerate(zip(time_points, AOS_vertices_list)):
+        # Normalized time for color
+        t_norm = (t - t_min) / (t_max - t_min) if t_max != t_min else 0.5
+        color = cmap(t_norm)
+
+        # Create 3D points by adding time as z-coordinate
+        vertices_3d = np.column_stack([vertices, np.full(len(vertices), t)])
+
+        try:
+            # Compute convex hull of the 2D vertices
+            hull_2d = sp.spatial.ConvexHull(vertices[:, :2])
+
+            # Create bottom face (at this time level)
+            bottom_face = vertices_3d[hull_2d.vertices]
+
+            # Plot the polygon at this time level
+            tri = Poly3DCollection([bottom_face[:, :3]], alpha=alpha)
+            tri.set_facecolor(color)
+            if show_edges:
+                tri.set_edgecolor(EDGES_COLORS)
+                tri.set_linewidth(EDGES_WIDTH)
+            ax.add_collection3d(tri)
+
+            # Connect to next time level if not the last
+            if t_idx < n_times - 1:
+                next_vertices = AOS_vertices_list[t_idx + 1]
+                next_t = time_points[t_idx + 1]
+
+                # Get hull vertices for both time levels
+                hull_curr = sp.spatial.ConvexHull(vertices[:, :2])
+                hull_next = sp.spatial.ConvexHull(next_vertices[:, :2])
+
+                curr_hull_pts = vertices[hull_curr.vertices]
+                next_hull_pts = next_vertices[hull_next.vertices]
+
+                # Create connecting faces between time levels
+                # Use simple approach: connect corresponding points
+                n_curr = len(curr_hull_pts)
+                n_next = len(next_hull_pts)
+
+                # Interpolate to match number of points
+                if n_curr != n_next:
+                    # Resample to common number of points
+                    n_common = max(n_curr, n_next)
+                    angles_curr = np.arctan2(curr_hull_pts[:, 1] - curr_hull_pts[:, 1].mean(),
+                                             curr_hull_pts[:, 0] - curr_hull_pts[:, 0].mean())
+                    angles_next = np.arctan2(next_hull_pts[:, 1] - next_hull_pts[:, 1].mean(),
+                                             next_hull_pts[:, 0] - next_hull_pts[:, 0].mean())
+
+                    # Sort by angle
+                    curr_hull_pts = curr_hull_pts[np.argsort(angles_curr)]
+                    next_hull_pts = next_hull_pts[np.argsort(angles_next)]
+
+                # Draw connecting lines/faces
+                n_pts = min(len(curr_hull_pts), len(next_hull_pts))
+                for i in range(n_pts):
+                    i_next = (i + 1) % n_pts
+
+                    # Create quadrilateral connecting two time levels
+                    quad = np.array([
+                        [curr_hull_pts[i, 0], curr_hull_pts[i, 1], t],
+                        [curr_hull_pts[i_next, 0], curr_hull_pts[i_next, 1], t],
+                        [next_hull_pts[i_next % len(next_hull_pts), 0],
+                         next_hull_pts[i_next % len(next_hull_pts), 1], next_t],
+                        [next_hull_pts[i % len(next_hull_pts), 0],
+                         next_hull_pts[i % len(next_hull_pts), 1], next_t]
+                    ])
+
+                    # Color interpolation for the connecting face
+                    t_mid_norm = ((t + next_t) / 2 - t_min) / (t_max - t_min) if t_max != t_min else 0.5
+                    face_color = cmap(t_mid_norm)
+
+                    face = Poly3DCollection([quad], alpha=alpha * 0.7)
+                    face.set_facecolor(face_color)
+                    if show_edges:
+                        face.set_edgecolor(EDGES_COLORS)
+                        face.set_linewidth(EDGES_WIDTH * 0.5)
+                    ax.add_collection3d(face)
+
+        except sp.spatial.QhullError:
+            # If convex hull fails, just plot points
+            ax.scatter(vertices[:, 0], vertices[:, 1],
+                      np.full(len(vertices), t), c=[color], s=10)
+
+    # Set labels
+    if labels is not None:
+        if len(labels) >= 2:
+            ax.set_xlabel(labels[0])
+            ax.set_ylabel(labels[1])
+        else:
+            ax.set_xlabel('$y_{1}$')
+            ax.set_ylabel('$y_{2}$')
+    else:
+        ax.set_xlabel('$y_{1}$')
+        ax.set_ylabel('$y_{2}$')
+
+    if time_label is not None:
+        ax.set_zlabel(time_label)
+    else:
+        ax.set_zlabel('$t$')
+
+    # Add colorbar for time
+    sm = plt.cm.ScalarMappable(cmap=cmap,
+                                norm=plt.Normalize(vmin=t_min, vmax=t_max))
+    sm.set_array([])
+    cbar = plt.colorbar(sm, ax=ax, shrink=0.6, aspect=20, pad=0.1)
+    cbar.set_label(time_label if time_label else 'Time')
+
+    ax.set_title('Dynamic Operability: AOS Evolution Over Time')
+
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_dynamic_operability_1D(results: dict,
+                                labels: str = None,
+                                time_label: str = None,
+                                colormap: str = 'viridis',
+                                figsize: tuple = (10, 6)) -> None:
+    """
+    Plot dynamic operability results for 1D output space, showing the evolution
+    of output ranges over time.
+
+    Parameters
+    ----------
+    results : dict
+        Results dictionary from dynamic_operability().
+    labels : str, optional
+        Labels for axes.
+    time_label : str, optional
+        Label for time axis.
+    colormap : str, optional
+        Colormap name. Default is 'viridis'.
+    figsize : tuple, optional
+        Figure size.
+    """
+
+    AOS_vertices_list = results['AOS_vertices']
+    time_points = results['time_points']
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    cmap = plt.cm.get_cmap(colormap)
+    t_min, t_max = time_points[0], time_points[-1]
+
+    for t_idx, (t, vertices) in enumerate(zip(time_points, AOS_vertices_list)):
+        t_norm = (t - t_min) / (t_max - t_min) if t_max != t_min else 0.5
+        color = cmap(t_norm)
+
+        y_min, y_max = vertices.min(), vertices.max()
+        ax.fill_between([t - 0.3, t + 0.3], y_min, y_max,
+                        color=color, alpha=0.7, edgecolor='k', linewidth=0.5)
+
+    if labels is not None and len(labels) >= 1:
+        ax.set_ylabel(labels[0])
+    else:
+        ax.set_ylabel('$y$')
+
+    ax.set_xlabel(time_label if time_label else 'Time')
+    ax.set_title('Dynamic Operability: Output Range Evolution')
+
+    plt.tight_layout()
+    plt.show()
+
+
+def dynamic_OI_eval(results: dict,
+                    DOS_bounds: np.ndarray,
+                    time_varying_DOS: Callable = None,
+                    perspective: str = 'outputs',
+                    plot: bool = True,
+                    labels: str = None,
+                    time_label: str = None) -> dict:
+    """
+    Evaluate the Operability Index (OI) over time for dynamic operability
+    analysis. This function computes the OI at each time point and can handle
+    both constant and time-varying Desired Output Sets (DOS).
+
+    This function is part of Python-based Process Operability package.
+
+    Control, Optimization and Design for Energy and Sustainability (CODES)
+    Group - West Virginia University - 2024
+
+    Author: Victor Alves
+
+    Parameters
+    ----------
+    results : dict
+        Results dictionary from dynamic_operability() containing:
+        - 'AOS_regions': List of pc.Region objects
+        - 'time_points': Array of time values
+    DOS_bounds : np.ndarray
+        Bounds on the Desired Output Set (DOS) for constant DOS case.
+        Each row corresponds to the lower and upper bound of each variable.
+        Used when time_varying_DOS is None.
+    time_varying_DOS : Callable, optional
+        Function that returns DOS bounds at a given time: DOS_bounds = f(t).
+        If provided, DOS_bounds parameter is ignored and the DOS is evaluated
+        at each time point. Default is None (constant DOS).
+    perspective : str, optional
+        String that determines in which perspective the OI will be evaluated.
+        Default is 'outputs'.
+    plot : bool, optional
+        Whether to plot the OI evolution over time. Default is True.
+    labels : str, optional
+        Labels for axes in supplementary plots.
+    time_label : str, optional
+        Label for the time axis.
+
+    Returns
+    -------
+    results_OI : dict
+        Dictionary containing:
+        - 'OI_values': Array of OI values at each time point (0-100%)
+        - 'time_points': Array of time values
+        - 'intersection_regions': List of intersection regions at each time
+        - 'DOS_regions': List of DOS regions used at each time
+
+    References
+    ----------
+    [1] S. Dinh and F. V. Lima. "Dynamic Operability Analysis for Process Design
+    and Control of Modular Natural Gas Utilization Systems." Ind. & Eng. Chem.
+    Res. 2023. https://doi.org/10.1021/acs.iecr.2c03543
+
+    Examples
+    --------
+    >>> # Using constant DOS
+    >>> DOS_bounds = np.array([[5, 15], [5, 15]])
+    >>> OI_results = dynamic_OI_eval(results, DOS_bounds)
+    >>>
+    >>> # Using time-varying DOS
+    >>> def DOS_t(t):
+    ...     return np.array([[5 + 0.1*t, 15 + 0.1*t], [5, 15]])
+    >>> OI_results = dynamic_OI_eval(results, None, time_varying_DOS=DOS_t)
+    """
+
+    AOS_regions = results['AOS_regions']
+    time_points = results['time_points']
+    n_times = len(time_points)
+
+    # Preallocate results
+    OI_values = np.zeros(n_times)
+    intersection_regions = []
+    DOS_regions_list = []
+
+    print(f"Evaluating dynamic Operability Index over {n_times} time points...")
+
+    for t_idx, t in enumerate(tqdm(time_points)):
+        # Get DOS bounds for this time
+        if time_varying_DOS is not None:
+            current_DOS_bounds = time_varying_DOS(t)
+        else:
+            current_DOS_bounds = DOS_bounds
+
+        # Create DOS region
+        DOS_region = pc.box2poly(current_DOS_bounds)
+        DOS_regions_list.append(DOS_region)
+
+        # Get AOS region for this time
+        AS_region = pc.reduce(AOS_regions[t_idx])
+
+        # Compute intersection
+        inter_list = []
+        for i in range(len(AS_region)):
+            intersection = pc.intersect(AS_region[i], DOS_region)
+            if intersection.fulldim and intersection.dim == DOS_region.dim:
+                inter_list.append(intersection)
+
+        if len(inter_list) == 0:
+            OI_values[t_idx] = 0.0
+            intersection_regions.append(None)
+            continue
+
+        overlapped_intersection = pc.Region(inter_list)
+
+        # Get bounding box
+        min_coord = overlapped_intersection.bounding_box[0]
+        max_coord = overlapped_intersection.bounding_box[1]
+        box_coord = np.hstack([min_coord, max_coord])
+        bound_box = pc.box2poly(box_coord)
+
+        # Remove overlapping using existing function
+        try:
+            intersection = process_overlapping_polytopes(bound_box,
+                                                         overlapped_intersection)
+            intersection_regions.append(intersection)
+
+            # Calculate volumes
+            if DOS_region.dim < 7:
+                intersect_volumes = []
+                for i in range(len(intersection)):
+                    v_intersect = pc.extreme(intersection[i])
+                    if v_intersect is not None:
+                        try:
+                            vol = sp.spatial.ConvexHull(v_intersect).volume
+                            intersect_volumes.append(vol)
+                        except sp.spatial.QhullError:
+                            continue
+
+                intersection_volume = sum(intersect_volumes)
+                v_DOS = pc.extreme(DOS_region)
+                DOS_volume = sp.spatial.ConvexHull(v_DOS).volume
+
+                OI_values[t_idx] = (intersection_volume / DOS_volume) * 100
+            else:
+                OI_values[t_idx] = (intersection.volume / DOS_region.volume) * 100
+
+        except RuntimeError:
+            OI_values[t_idx] = 0.0
+            intersection_regions.append(None)
+
+    # Prepare results
+    results_OI = {
+        'OI_values': OI_values,
+        'time_points': time_points,
+        'intersection_regions': intersection_regions,
+        'DOS_regions': DOS_regions_list
+    }
+
+    # Plot OI evolution
+    if plot:
+        fig, ax = plt.subplots(figsize=(10, 6))
+
+        ax.plot(time_points, OI_values, 'b-o', linewidth=2, markersize=6)
+        ax.fill_between(time_points, 0, OI_values, alpha=0.3)
+
+        ax.set_xlabel(time_label if time_label else 'Time')
+        ax.set_ylabel('Operability Index (%)')
+        ax.set_title('Dynamic Operability Index Evolution')
+        ax.set_ylim([0, 105])
+        ax.grid(True, alpha=0.3)
+
+        # Add horizontal line at 100%
+        ax.axhline(y=100, color='g', linestyle='--', alpha=0.7, label='Full Operability')
+        ax.legend()
+
+        plt.tight_layout()
+        plt.show()
+
+    # Print summary
+    print(f"\nDynamic OI Summary:")
+    print(f"  Time range: [{time_points[0]:.2f}, {time_points[-1]:.2f}]")
+    print(f"  OI range: [{OI_values.min():.2f}%, {OI_values.max():.2f}%]")
+    print(f"  Average OI: {OI_values.mean():.2f}%")
+
+    return results_OI
+
+
+def plot_dynamic_operability_with_DOS(results: dict,
+                                      DOS_bounds: np.ndarray,
+                                      time_varying_DOS: Callable = None,
+                                      alpha: float = 0.5,
+                                      colormap: str = 'viridis',
+                                      figsize: tuple = (12, 8)) -> None:
+    """
+    Plot dynamic operability with both AOS evolution and DOS region(s) shown.
+    This visualization shows how the Achievable Output Set (AOS) evolves over
+    time relative to the Desired Output Set (DOS).
+
+    Parameters
+    ----------
+    results : dict
+        Results dictionary from dynamic_operability().
+    DOS_bounds : np.ndarray
+        Bounds on the Desired Output Set (DOS) for constant DOS.
+    time_varying_DOS : Callable, optional
+        Function that returns DOS bounds at a given time.
+    alpha : float, optional
+        Transparency. Default is 0.5.
+    colormap : str, optional
+        Colormap for AOS polytopes. Default is 'viridis'.
+    figsize : tuple, optional
+        Figure size.
+    """
+
+    AOS_vertices_list = results['AOS_vertices']
+    time_points = results['time_points']
+    AOS_regions = results['AOS_regions']
+
+    if AOS_regions[0].dim != 2:
+        print("This function currently supports 2D output spaces only.")
+        return
+
+    fig = plt.figure(figsize=figsize)
+    ax = fig.add_subplot(111, projection='3d')
+
+    cmap = plt.cm.get_cmap(colormap)
+    t_min, t_max = time_points[0], time_points[-1]
+
+    # Plot AOS evolution
+    for t_idx, (t, vertices) in enumerate(zip(time_points, AOS_vertices_list)):
+        t_norm = (t - t_min) / (t_max - t_min) if t_max != t_min else 0.5
+        color = cmap(t_norm)
+
+        try:
+            hull_2d = sp.spatial.ConvexHull(vertices[:, :2])
+            vertices_3d = np.column_stack([vertices[hull_2d.vertices],
+                                           np.full(len(hull_2d.vertices), t)])
+
+            tri = Poly3DCollection([vertices_3d], alpha=alpha)
+            tri.set_facecolor(color)
+            tri.set_edgecolor(EDGES_COLORS)
+            tri.set_linewidth(EDGES_WIDTH)
+            ax.add_collection3d(tri)
+        except sp.spatial.QhullError:
+            pass
+
+    # Plot DOS region(s)
+    for t_idx, t in enumerate(time_points):
+        if time_varying_DOS is not None:
+            current_DOS_bounds = time_varying_DOS(t)
+        else:
+            current_DOS_bounds = DOS_bounds
+
+        # Get DOS vertices
+        DOS_vertices = get_extreme_vertices(current_DOS_bounds)
+        DOS_vertices_3d = np.column_stack([DOS_vertices,
+                                            np.full(len(DOS_vertices), t)])
+
+        # Plot DOS at this time (with transparency)
+        try:
+            hull_DOS = sp.spatial.ConvexHull(DOS_vertices[:, :2])
+            DOS_face = DOS_vertices_3d[hull_DOS.vertices]
+
+            tri_DOS = Poly3DCollection([DOS_face], alpha=alpha * 0.3)
+            tri_DOS.set_facecolor(DS_COLOR)
+            tri_DOS.set_edgecolor(DS_COLOR)
+            tri_DOS.set_linewidth(EDGES_WIDTH * 2)
+            tri_DOS.set_linestyle('--')
+            ax.add_collection3d(tri_DOS)
+        except sp.spatial.QhullError:
+            pass
+
+    # Set labels
+    ax.set_xlabel('$y_{1}$')
+    ax.set_ylabel('$y_{2}$')
+    ax.set_zlabel('Time')
+
+    # Create legend patches
+    AOS_patch = mpatches.Patch(color=cmap(0.5), alpha=alpha, label='AOS(t)')
+    DOS_patch = mpatches.Patch(color=DS_COLOR, alpha=0.3, label='DOS')
+    ax.legend(handles=[AOS_patch, DOS_patch])
+
+    ax.set_title('Dynamic Operability: AOS(t) vs DOS')
+
+    plt.tight_layout()
+    plt.show()
+
+
+def compute_dynamic_operability_envelope(results: dict) -> dict:
+    """
+    Compute the envelope (union) of all AOS regions across time, representing
+    the total reachable output space over the entire time horizon.
+
+    Parameters
+    ----------
+    results : dict
+        Results dictionary from dynamic_operability().
+
+    Returns
+    -------
+    envelope_results : dict
+        Dictionary containing:
+        - 'envelope_region': Union of all AOS regions
+        - 'envelope_vertices': Vertices of the envelope convex hull
+        - 'individual_volumes': Volume of AOS at each time point
+        - 'envelope_volume': Volume of the total envelope
+    """
+
+    AOS_regions = results['AOS_regions']
+    AOS_vertices_list = results['AOS_vertices']
+    time_points = results['time_points']
+
+    # Compute individual volumes
+    individual_volumes = []
+    for region in AOS_regions:
+        try:
+            vol = region.volume
+            individual_volumes.append(vol)
+        except:
+            individual_volumes.append(0.0)
+
+    # Compute envelope (union of all vertices)
+    all_vertices = np.vstack(AOS_vertices_list)
+
+    try:
+        hull = sp.spatial.ConvexHull(all_vertices)
+        envelope_vertices = all_vertices[hull.vertices]
+        envelope_volume = hull.volume
+        envelope_region = pc.qhull(envelope_vertices)
+    except sp.spatial.QhullError:
+        envelope_vertices = all_vertices
+        envelope_volume = 0.0
+        envelope_region = None
+
+    envelope_results = {
+        'envelope_region': envelope_region,
+        'envelope_vertices': envelope_vertices,
+        'individual_volumes': np.array(individual_volumes),
+        'envelope_volume': envelope_volume,
+        'time_points': time_points
+    }
+
+    return envelope_results
