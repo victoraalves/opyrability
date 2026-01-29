@@ -2451,23 +2451,32 @@ def are_overlapping(poly1, poly2):
 # Dynamic Operability Mapping Functions
 # =============================================================================
 # The functions below implement dynamic (time-varying) operability analysis,
-# enabling the evaluation of how operability sets evolve over time or with
-# respect to a varying parameter.
+# enabling the evaluation of how operability sets evolve over time. The model
+# is specified as a dynamic system (ODE/DAE) that is solved over time using
+# scipy's ODE solvers.
+
+from scipy.integrate import solve_ivp
+
 
 def dynamic_operability(model: Callable[..., Union[float, np.ndarray]],
+                        y0: Union[np.ndarray, Callable],
                         AIS_bounds: np.ndarray,
                         AIS_resolution: np.ndarray,
-                        time_bounds: np.ndarray,
-                        time_resolution: int,
+                        time_span: np.ndarray,
+                        time_eval: np.ndarray = None,
+                        output_func: Callable = None,
                         polytopic_trace: str = 'simplices',
+                        solver_method: str = 'RK45',
+                        solver_options: dict = None,
                         plot: bool = True,
+                        experiment_experiment: bool = False,
                         labels: str = None,
                         time_label: str = None) -> dict:
     """
-    Compute and visualize dynamic (time-varying) operability sets. This function
-    generates Achievable Output Sets (AOS) at multiple time instances and
-    constructs connected polytopes that show the temporal evolution of the
-    operability region.
+    Compute and visualize dynamic operability sets by solving a dynamic system
+    (ODE/DAE) over time. This function solves the dynamic model for each input
+    in the discretized AIS and constructs connected polytopes showing the
+    temporal evolution of the Achievable Output Set (AOS).
 
     This implements the dynamic operability analysis methodology as described
     in the paper: "Dynamic Operability Analysis for Process Design and Control
@@ -2482,33 +2491,62 @@ def dynamic_operability(model: Callable[..., Union[float, np.ndarray]],
 
     Parameters
     ----------
-    model : Callable[..., Union[float, np.ndarray]]
-        Time-varying process model that calculates the relationship between
-        inputs (AIS) and outputs (AOS). The model should accept inputs and time
-        as arguments: model(u, t) -> y, where u is the input vector, t is time,
-        and y is the output vector.
+    model : Callable
+        Dynamic system model (ODE right-hand side). Should have the signature:
+            dydt = model(t, y, u)
+        where:
+            - t : float - current time
+            - y : np.ndarray - state vector
+            - u : np.ndarray - input vector (from AIS)
+        Returns:
+            - dydt : np.ndarray - time derivative of state vector
+
+    y0 : np.ndarray or Callable
+        Initial conditions for the state vector. Can be:
+            - np.ndarray: Same initial condition for all inputs
+            - Callable: Function y0(u) that returns initial conditions
+              depending on the input, enabling input-dependent initialization
+
     AIS_bounds : np.ndarray
         Bounds on the Available Input Set (AIS). Each row corresponds to the
-        lower and upper bound of each AIS variable.
+        lower and upper bound of each AIS variable. Shape: (n_inputs, 2)
+
     AIS_resolution : np.ndarray
         Array containing the resolution of the discretization grid for the AIS.
         Each element corresponds to the resolution of each variable.
-    time_bounds : np.ndarray
-        Array of shape (2,) containing [t_initial, t_final] for the time range.
-    time_resolution : int
-        Number of time points to discretize the time range.
+
+    time_span : np.ndarray
+        Array of shape (2,) containing [t_initial, t_final] for the integration.
+
+    time_eval : np.ndarray, optional
+        Time points at which to store the solution and build AOS polytopes.
+        If None, automatically generates points based on solver output.
+
+    output_func : Callable, optional
+        Output function that extracts outputs from states: y_out = h(y, u).
+        If None, the state vector itself is used as the output.
+        Signature: output_func(y, u) -> y_out
+
     polytopic_trace : str, optional
         Determines if the polytopes will be constructed using simplices or
         polyhedra. Default is 'simplices'. Additional option is 'polyhedra'.
+
+    solver_method : str, optional
+        ODE solver method for scipy.integrate.solve_ivp. Options include:
+        'RK45' (default), 'RK23', 'DOP853', 'Radau', 'BDF', 'LSODA'.
+        Use 'Radau' or 'BDF' for stiff problems.
+
+    solver_options : dict, optional
+        Additional options passed to solve_ivp (e.g., rtol, atol, max_step).
+
     plot : bool, optional
-        Defines if the plot of dynamic operability sets is desired. Default is
-        True. For 2D output spaces, generates a 3D plot with time as the third
-        axis, showing connected polytopes evolving over time.
+        Whether to plot the dynamic operability sets. Default is True.
+
     labels : str, optional
-        Labels for output axes. Accepts TeX math input as it uses matplotlib
-        math rendering. Default is None (uses y1, y2, ...).
+        Labels for output axes. Accepts TeX math input.
+
     time_label : str, optional
-        Label for the time axis. Default is None (uses 't' or 'Time').
+        Label for the time axis. Default is 't'.
 
     Returns
     -------
@@ -2516,8 +2554,9 @@ def dynamic_operability(model: Callable[..., Union[float, np.ndarray]],
         Dictionary containing:
         - 'AOS_regions': List of pc.Region objects, one for each time point
         - 'AOS_vertices': List of vertex arrays for each time point
-        - 'time_points': Array of discretized time values
-        - 'AIS': Discretized Available Input Set
+        - 'time_points': Array of time values where AOS was computed
+        - 'AIS': Discretized Available Input Set (flattened)
+        - 'trajectories': Dict mapping input index to full trajectory data
         - 'polytopes_by_time': List of polytope lists for each time point
 
     References
@@ -2536,95 +2575,287 @@ def dynamic_operability(model: Callable[..., Union[float, np.ndarray]],
     >>> import numpy as np
     >>> from opyrability import dynamic_operability
     >>>
-    >>> # Define a time-varying model
-    >>> def model(u, t):
-    ...     y1 = u[0] + 0.5*u[1] + 0.1*t
-    ...     y2 = 0.3*u[0] + u[1] - 0.05*t
-    ...     return np.array([y1, y2])
+    >>> # Define a dynamic system: two coupled ODEs with input u
+    >>> def reactor_model(t, y, u):
+    ...     # y = [concentration_A, concentration_B]
+    ...     # u = [feed_rate, temperature]
+    ...     k1 = 0.1 * np.exp(0.05 * u[1])  # temp-dependent rate
+    ...     k2 = 0.05
+    ...     dCa_dt = u[0] * (1.0 - y[0]) - k1 * y[0]
+    ...     dCb_dt = k1 * y[0] - k2 * y[1] - u[0] * y[1]
+    ...     return np.array([dCa_dt, dCb_dt])
     >>>
-    >>> AIS_bounds = np.array([[0, 10], [0, 10]])
+    >>> # Initial conditions
+    >>> y0 = np.array([0.5, 0.1])
+    >>>
+    >>> # Input bounds and resolution
+    >>> AIS_bounds = np.array([[0.1, 1.0],    # feed_rate
+    ...                        [300, 400]])   # temperature
     >>> AIS_resolution = [5, 5]
-    >>> time_bounds = np.array([0, 10])
-    >>> time_resolution = 5
     >>>
-    >>> results = dynamic_operability(model, AIS_bounds, AIS_resolution,
-    ...                               time_bounds, time_resolution)
+    >>> # Time span
+    >>> time_span = np.array([0, 50])
+    >>> time_eval = np.linspace(0, 50, 10)
+    >>>
+    >>> # Output function (select which states are outputs)
+    >>> def output_func(y, u):
+    ...     return y  # Both concentrations are outputs
+    >>>
+    >>> results = dynamic_operability(
+    ...     reactor_model, y0, AIS_bounds, AIS_resolution,
+    ...     time_span, time_eval, output_func=output_func
+    ... )
     """
 
-    # Discretize the time range
-    time_points = np.linspace(time_bounds[0], time_bounds[1], time_resolution)
+    # Default solver options
+    if solver_options is None:
+        solver_options = {'rtol': 1e-6, 'atol': 1e-9}
 
-    # Get dimensions
-    n_inputs = AIS_bounds.shape[0]
+    # Generate time evaluation points if not provided
+    if time_eval is None:
+        time_eval = np.linspace(time_span[0], time_span[1], 10)
 
-    # Create the discretized AIS (constant across time)
-    AIS = create_grid(AIS_bounds, AIS_resolution)
+    n_times = len(time_eval)
 
-    # Preallocate results
+    # Create the discretized AIS
+    AIS_flat = create_grid(AIS_bounds, AIS_resolution)
+    n_inputs_total = AIS_flat.shape[0]
+
+    # Storage for trajectories at each input point
+    trajectories = {}
+    outputs_by_time = {t_idx: [] for t_idx in range(n_times)}
+
+    print(f"Solving dynamic system for {n_inputs_total} input points...")
+
+    # Solve the ODE for each input point in the AIS
+    for u_idx in tqdm(range(n_inputs_total)):
+        u = AIS_flat[u_idx]
+
+        # Get initial condition (may depend on input)
+        if callable(y0):
+            y0_u = y0(u)
+        else:
+            y0_u = y0.copy()
+
+        # Create ODE function with this specific input
+        def ode_func(t, y, u_val=u):
+            return model(t, y, u_val)
+
+        # Solve the ODE
+        try:
+            sol = solve_ivp(
+                ode_func,
+                time_span,
+                y0_u,
+                method=solver_method,
+                t_eval=time_eval,
+                **solver_options
+            )
+
+            if sol.success:
+                trajectories[u_idx] = {
+                    'u': u,
+                    't': sol.t,
+                    'y': sol.y.T  # Shape: (n_times, n_states)
+                }
+
+                # Extract outputs at each time point
+                for t_idx in range(len(sol.t)):
+                    y_t = sol.y[:, t_idx]
+
+                    # Apply output function if provided
+                    if output_func is not None:
+                        y_out = output_func(y_t, u)
+                    else:
+                        y_out = y_t
+
+                    outputs_by_time[t_idx].append(y_out)
+            else:
+                print(f"Warning: ODE solver failed for input {u_idx}: {sol.message}")
+
+        except Exception as e:
+            print(f"Warning: Exception for input {u_idx}: {e}")
+
+    # Now build polytopes at each time point
+    print(f"Building polytopes at {n_times} time points...")
+
     AOS_regions = []
     AOS_vertices_list = []
     polytopes_by_time = []
 
-    # Compute AOS at each time point
-    print(f"Computing dynamic operability over {time_resolution} time points...")
+    # Get output dimension from first successful solve
+    n_outputs = None
+    for t_idx in range(n_times):
+        if len(outputs_by_time[t_idx]) > 0:
+            n_outputs = len(outputs_by_time[t_idx][0])
+            break
 
-    for t_idx, t in enumerate(tqdm(time_points)):
-        # Create a model wrapper for this specific time point
-        def model_at_t(u, t_val=t):
-            return model(u, t_val)
+    if n_outputs is None:
+        raise RuntimeError("No successful ODE solutions obtained.")
 
-        # Use existing AIS2AOS_map function for forward mapping
-        AIS_grid, AOS_grid = AIS2AOS_map(model_at_t,
-                                          AIS_bounds,
-                                          AIS_resolution,
-                                          plot=False)
+    for t_idx in tqdm(range(n_times)):
+        outputs_at_t = outputs_by_time[t_idx]
 
-        # Generate polytopes using existing functions
-        if polytopic_trace == 'simplices':
-            AIS_poly, AOS_poly = points2simplices(AIS_grid, AOS_grid)
-        elif polytopic_trace == 'polyhedra':
-            AIS_poly, AOS_poly = points2polyhedra(AIS_grid, AOS_grid)
-        else:
-            print('Invalid option for polytopic tracing. Using simplices.')
-            AIS_poly, AOS_poly = points2simplices(AIS_grid, AOS_grid)
+        if len(outputs_at_t) == 0:
+            # No valid outputs at this time
+            AOS_regions.append(None)
+            AOS_vertices_list.append(np.array([]))
+            polytopes_by_time.append([])
+            continue
 
-        # Create polytope region for this time point
-        Polytopes = []
-        Vertices_list = []
-        for i in range(len(AOS_poly)):
-            Vertices = AOS_poly[i]
-            Vertices_list.append(Vertices)
-            Polytopes.append(pc.qhull(Vertices))
+        # Convert to array
+        AOS_points = np.array(outputs_at_t)
 
-        AOS_region = pc.Region(Polytopes)
-        AOS_regions.append(AOS_region)
-        AOS_vertices_list.append(np.concatenate(Vertices_list, axis=0))
-        polytopes_by_time.append(Polytopes)
+        # Reshape for polytope construction
+        # We need to match the structure expected by points2simplices/polyhedra
+        # which expects shape: (*resolution, n_outputs)
+        try:
+            AOS_grid = AOS_points.reshape(AIS_resolution + [n_outputs])
+            AIS_grid = AIS_flat.reshape(AIS_resolution + [AIS_bounds.shape[0]])
+
+            # Generate polytopes using existing functions
+            if polytopic_trace == 'simplices':
+                AIS_poly, AOS_poly = points2simplices(AIS_grid, AOS_grid)
+            elif polytopic_trace == 'polyhedra':
+                AIS_poly, AOS_poly = points2polyhedra(AIS_grid, AOS_grid)
+            else:
+                print('Invalid option for polytopic tracing. Using simplices.')
+                AIS_poly, AOS_poly = points2simplices(AIS_grid, AOS_grid)
+
+            # Create polytope region for this time point
+            Polytopes = []
+            Vertices_list = []
+            for i in range(len(AOS_poly)):
+                Vertices = AOS_poly[i]
+                Vertices_list.append(Vertices)
+                Polytopes.append(pc.qhull(Vertices))
+
+            AOS_region = pc.Region(Polytopes)
+            AOS_regions.append(AOS_region)
+            AOS_vertices_list.append(np.concatenate(Vertices_list, axis=0))
+            polytopes_by_time.append(Polytopes)
+
+        except Exception as e:
+            print(f"Warning: Could not build polytopes at t={time_eval[t_idx]}: {e}")
+            # Fall back to convex hull of all points
+            try:
+                hull_region = pc.qhull(AOS_points)
+                AOS_regions.append(pc.Region([hull_region]))
+                AOS_vertices_list.append(AOS_points)
+                polytopes_by_time.append([hull_region])
+            except:
+                AOS_regions.append(None)
+                AOS_vertices_list.append(AOS_points)
+                polytopes_by_time.append([])
 
     # Prepare results dictionary
     results = {
         'AOS_regions': AOS_regions,
         'AOS_vertices': AOS_vertices_list,
-        'time_points': time_points,
-        'AIS': AIS,
-        'polytopes_by_time': polytopes_by_time
+        'time_points': time_eval,
+        'AIS': AIS_flat,
+        'trajectories': trajectories,
+        'polytopes_by_time': polytopes_by_time,
+        'n_outputs': n_outputs
     }
 
     # Plot if requested and dimension is appropriate
     if plot:
-        if AOS_regions[0].dim == 2:
-            plot_dynamic_operability(results,
-                                     labels=labels,
-                                     time_label=time_label)
-        elif AOS_regions[0].dim == 1:
-            plot_dynamic_operability_1D(results,
-                                        labels=labels,
-                                        time_label=time_label)
-        else:
-            print(f'Plotting not supported for {AOS_regions[0].dim}D output space.',
-                  'Results are still returned for analysis.')
+        valid_regions = [r for r in AOS_regions if r is not None]
+        if len(valid_regions) > 0:
+            dim = valid_regions[0].dim
+            if dim == 2:
+                plot_dynamic_operability(results,
+                                         labels=labels,
+                                         time_label=time_label)
+            elif dim == 1:
+                plot_dynamic_operability_1D(results,
+                                            labels=labels,
+                                            time_label=time_label)
+            else:
+                print(f'Plotting not supported for {dim}D output space.',
+                      'Results are still returned for analysis.')
 
     return results
+
+
+def solve_experiment_experiment(model: Callable,
+                                 y0: Union[np.ndarray, Callable],
+                                 u_trajectory: Callable,
+                                 time_span: np.ndarray,
+                                 time_eval: np.ndarray = None,
+                                 output_func: Callable = None,
+                                 solver_method: str = 'RK45',
+                                 solver_options: dict = None) -> dict:
+    """
+    Solve a dynamic system with a time-varying input trajectory.
+    This is a helper function for simulating a single experiment.
+
+    Parameters
+    ----------
+    model : Callable
+        Dynamic model: dydt = model(t, y, u)
+    y0 : np.ndarray
+        Initial conditions
+    u_trajectory : Callable
+        Input as function of time: u = u_trajectory(t)
+    time_span : np.ndarray
+        [t_initial, t_final]
+    time_eval : np.ndarray, optional
+        Evaluation time points
+    output_func : Callable, optional
+        Output function: y_out = output_func(y, u)
+    solver_method : str
+        ODE solver method
+    solver_options : dict
+        Solver options
+
+    Returns
+    -------
+    results : dict
+        Dictionary with 't', 'y', 'u', 'y_out' arrays
+    """
+
+    if solver_options is None:
+        solver_options = {'rtol': 1e-6, 'atol': 1e-9}
+
+    if time_eval is None:
+        time_eval = np.linspace(time_span[0], time_span[1], 100)
+
+    def ode_func(t, y):
+        u = u_trajectory(t)
+        return model(t, y, u)
+
+    sol = solve_ivp(
+        ode_func,
+        time_span,
+        y0,
+        method=solver_method,
+        t_eval=time_eval,
+        **solver_options
+    )
+
+    if not sol.success:
+        raise RuntimeError(f"ODE solver failed: {sol.message}")
+
+    # Compute outputs
+    y_out_list = []
+    u_list = []
+    for t_idx, t in enumerate(sol.t):
+        u = u_trajectory(t)
+        u_list.append(u)
+        y = sol.y[:, t_idx]
+        if output_func is not None:
+            y_out_list.append(output_func(y, u))
+        else:
+            y_out_list.append(y)
+
+    return {
+        't': sol.t,
+        'y': sol.y.T,
+        'u': np.array(u_list),
+        'y_out': np.array(y_out_list)
+    }
 
 
 def plot_dynamic_operability(results: dict,
