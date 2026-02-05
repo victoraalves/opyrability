@@ -6,7 +6,10 @@ from itertools import permutations as perms
 from typing import Callable, Union
 from itertools import permutations as perms
 from typing import Callable, Union
-from tqdm.notebook import tqdm
+try:
+    from tqdm.notebook import tqdm
+except ImportError:
+    from tqdm import tqdm
 
 # Linear Algebra
 import numpy as np
@@ -16,7 +19,12 @@ from numpy.linalg import norm
 import scipy as sp
 from scipy.optimize import root
 from scipy.optimize import differential_evolution as DE
-from cyipopt import minimize_ipopt
+try:
+    from cyipopt import minimize_ipopt
+    CYIPOPT_AVAILABLE = True
+except ImportError:
+    CYIPOPT_AVAILABLE = False
+    minimize_ipopt = None
 
 # Polytopic calculations
 import polytope as pc
@@ -2618,7 +2626,11 @@ def dynamic_operability(model: Callable[..., Union[float, np.ndarray]],
     n_times = len(time_eval)
 
     # Create the discretized AIS
-    AIS_flat = create_grid(AIS_bounds, AIS_resolution)
+    AIS_grid = create_grid(AIS_bounds, AIS_resolution)
+    # Flatten the grid to get list of input points
+    # create_grid returns shape (*resolution, n_inputs), e.g. (5, 5, 2)
+    n_input_dims = AIS_bounds.shape[0]
+    AIS_flat = AIS_grid.reshape(-1, n_input_dims)
     n_inputs_total = AIS_flat.shape[0]
 
     # Storage for trajectories at each input point
@@ -2728,12 +2740,23 @@ def dynamic_operability(model: Callable[..., Union[float, np.ndarray]],
             for i in range(len(AOS_poly)):
                 Vertices = AOS_poly[i]
                 Vertices_list.append(Vertices)
-                Polytopes.append(pc.qhull(Vertices))
+                try:
+                    poly = pc.qhull(Vertices)
+                    if poly is not None and len(poly.A) > 0:
+                        Polytopes.append(poly)
+                except:
+                    pass  # Skip degenerate simplices
 
-            AOS_region = pc.Region(Polytopes)
-            AOS_regions.append(AOS_region)
-            AOS_vertices_list.append(np.concatenate(Vertices_list, axis=0))
-            polytopes_by_time.append(Polytopes)
+            if len(Polytopes) > 0:
+                AOS_region = pc.Region(Polytopes)
+                AOS_regions.append(AOS_region)
+                AOS_vertices_list.append(np.concatenate(Vertices_list, axis=0))
+                polytopes_by_time.append(Polytopes)
+            else:
+                # No valid polytopes - store vertices only
+                AOS_regions.append(None)
+                AOS_vertices_list.append(np.concatenate(Vertices_list, axis=0))
+                polytopes_by_time.append([])
 
         except Exception as e:
             print(f"Warning: Could not build polytopes at t={time_eval[t_idx]}: {e}")
@@ -2908,8 +2931,31 @@ def plot_dynamic_operability(results: dict,
     time_points = results['time_points']
     AOS_regions = results['AOS_regions']
 
+    # Find first valid region for dimension check
+    valid_region = None
+    for r in AOS_regions:
+        if r is not None:
+            try:
+                if hasattr(r, 'list_poly') and len(r.list_poly) > 0:
+                    valid_region = r
+                    break
+            except:
+                pass
+
+    if valid_region is None:
+        print("Warning: No valid polytope regions found. Using vertex-based plotting.")
+        # Determine dimension from vertices instead
+        for verts in AOS_vertices_list:
+            if len(verts) > 0:
+                dim = verts.shape[1] if len(verts.shape) > 1 else 1
+                break
+        else:
+            dim = 2  # default
+    else:
+        dim = valid_region.dim
+
     # Check dimension
-    if AOS_regions[0].dim != 2:
+    if dim != 2:
         print(f"This plotting function is designed for 2D output spaces. "
               f"Current dimension: {AOS_regions[0].dim}")
         return
@@ -3184,13 +3230,51 @@ def dynamic_OI_eval(results: dict,
         DOS_regions_list.append(DOS_region)
 
         # Get AOS region for this time
-        AS_region = pc.reduce(AOS_regions[t_idx])
+        AOS_vertices = results['AOS_vertices'][t_idx]
+
+        if AOS_vertices is None or len(AOS_vertices) < 3:
+            OI_values[t_idx] = 0.0
+            intersection_regions.append(None)
+            continue
+
+        # Get unique vertices (remove duplicates that can cause degenerate hulls)
+        unique_vertices = np.unique(AOS_vertices, axis=0)
+        if len(unique_vertices) < 3:
+            OI_values[t_idx] = 0.0
+            intersection_regions.append(None)
+            continue
+
+        # Try to use the polytope region, fallback to convex hull of vertices
+        AS_region = None
+        try:
+            if AOS_regions[t_idx] is not None:
+                AS_region = pc.reduce(AOS_regions[t_idx])
+                if len(AS_region.list_poly) == 0:
+                    AS_region = None
+        except:
+            AS_region = None
+
+        # Fallback: create convex hull from unique vertices
+        if AS_region is None:
+            try:
+                hull_poly = pc.qhull(unique_vertices)
+                if hull_poly is not None and len(hull_poly.A) > 0:
+                    AS_region = pc.Region([hull_poly])
+                else:
+                    OI_values[t_idx] = 0.0
+                    intersection_regions.append(None)
+                    continue
+            except Exception as e:
+                OI_values[t_idx] = 0.0
+                intersection_regions.append(None)
+                continue
 
         # Compute intersection
         inter_list = []
         for i in range(len(AS_region)):
             intersection = pc.intersect(AS_region[i], DOS_region)
-            if intersection.fulldim and intersection.dim == DOS_region.dim:
+            # Use is_empty check instead of fulldim (which can be None initially)
+            if not pc.is_empty(intersection) and intersection.dim == DOS_region.dim:
                 inter_list.append(intersection)
 
         if len(inter_list) == 0:
